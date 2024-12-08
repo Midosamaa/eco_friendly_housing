@@ -5,6 +5,7 @@ from datetime import datetime
 import paho.mqtt.client as mqtt  # Import de la bibliothèque MQTT
 import json  # Pour traiter les messages JSON
 import hashlib
+from datetime import datetime
 
 app = Flask(__name__, template_folder="../front/html", static_folder="../static")
 CORS(app)
@@ -31,9 +32,97 @@ def check_session():
     return f"Valeur dans la session : {valeur}"
 
 
-@app.route('/consommation')
+@app.route('/consommation', methods=['GET', 'POST'])
 def consommation():
-    return render_template('consommation.html')
+    user_id = session.get('user_id')
+    if user_id is None:
+        return redirect(url_for('login'))
+
+    # Paramètre de filtrage (par mois, année ou tout)
+    selected_period = request.args.get('period', 'month')
+
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT logement_id FROM users WHERE id = ?", (user_id,))
+    logement_row = cursor.fetchone()
+
+    if logement_row is None:
+        return "Logement introuvable", 404
+
+    logement_id = logement_row[0]
+
+    # Calcul de la date pour le filtrage
+    if selected_period == 'month':
+        date_filter = datetime.now().strftime('%Y-%m')
+        cursor.execute("""
+            SELECT type, date_fact, val_consommee, montant
+            FROM facture
+            WHERE logement_id = ? AND date_fact LIKE ?
+            ORDER BY date_fact
+        """, (logement_id, f'{date_filter}%'))
+    elif selected_period == 'year':
+        year_filter = datetime.now().strftime('%Y')
+        cursor.execute("""
+            SELECT type, date_fact, val_consommee, montant
+            FROM facture
+            WHERE logement_id = ? AND date_fact LIKE ?
+            ORDER BY date_fact
+        """, (logement_id, f'{year_filter}%'))
+    else:
+        cursor.execute("""
+            SELECT type, date_fact, val_consommee, montant
+            FROM facture
+            WHERE logement_id = ?
+            ORDER BY date_fact
+        """, (logement_id,))
+
+    factures = cursor.fetchall()
+
+    consommations = {
+        'electricity': [],
+        'water': [],
+        'gas': [],
+        'internet': []  # Ajout de l'internet
+    }
+
+    for type_conso, date, consommee, montant in factures:
+        if type_conso in consommations:
+            consommations[type_conso].append({
+                'date': date,
+                'consommation': consommee,
+                'montant': montant
+            })
+        else:
+            print(f"Type inconnu ignoré : {type_conso}")
+
+    conn.close()
+
+    return render_template('consommation.html', consommations=consommations, period=selected_period)
+
+
+@app.route('/factures/<int:id>', methods=['DELETE'])
+def supprimer_facture(id):
+    try:
+        conn = connect_db()
+        cursor = conn.cursor()
+
+        # Supprimer la facture avec l'id donné
+        cursor.execute("DELETE FROM facture WHERE id = ?", (id,))
+        conn.commit()
+
+        # Vérifiez si une facture a été supprimée
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Facture non trouvée"}), 404
+
+        return jsonify({"message": "Facture supprimée avec succès"}), 200
+
+    except Exception as e:
+        print("Erreur lors de la suppression de la facture :", e)
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cursor.close()
+        conn.close()
 
 @app.route('/capteurs')
 def capteurs():
@@ -47,15 +136,56 @@ def economies():
 def configuration():
     return render_template('configuration.html')
 
-@app.route('/change-password')
+@app.route('/change-password', methods=['GET', 'POST'])
 def change_password():
-    # Afficher la page de changement de mot de passe
-    return render_template('change-password.html')
+    # Vérifie si l'utilisateur est connecté (session)
+    if 'user_id' not in session:
+        return redirect(url_for('login'))  # Redirige vers la page de connexion si non authentifié
 
+    if request.method == 'POST':
+        # Récupère les champs du formulaire
+        current_password = request.form.get('currentPassword')
+        new_password = request.form.get('newPassword')
+        confirm_password = request.form.get('confirmPassword')
+
+        try:
+            conn = connect_db()
+            cursor = conn.cursor()
+
+            # Récupère le mot de passe hashé de l'utilisateur actuel
+            cursor.execute('SELECT password_hash FROM users WHERE id = ?', (session['user_id'],))
+            user = cursor.fetchone()
+
+            if not user:
+                return jsonify({"status": "error", "message": "Utilisateur non trouvé."}), 400
+
+            stored_password_hash = user[0]
+
+            # Vérifie que le mot de passe actuel correspond à celui stocké dans la base de données
+            if hashlib.sha256(current_password.encode()).hexdigest() != stored_password_hash:
+                return jsonify({"status": "error", "message": "Le mot de passe actuel est incorrect."}), 400
+
+            # Vérifie que les nouveaux mots de passe correspondent
+            if new_password != confirm_password:
+                return jsonify({"status": "error", "message": "Les nouveaux mots de passe ne correspondent pas."}), 400
+
+            # Hache le nouveau mot de passe
+            new_password_hash = hashlib.sha256(new_password.encode()).hexdigest()
+
+            # Met à jour le mot de passe dans la base de données
+            cursor.execute('UPDATE users SET password_hash = ? WHERE id = ?', (new_password_hash, session['user_id']))
+            conn.commit()
+
+            return jsonify({"status": "success", "message": "Mot de passe changé avec succès."}), 200
+
+        except Exception as e:
+            return jsonify({"status": "error", "message": "Erreur interne."}), 500
+
+    return render_template('change-password.html')  # Affiche le formulaire de changement de mot de passe
 @app.route('/logout')
 def logout():
     session.pop('user_id', None)
-    return redirect('/login')  # Rediriger vers la page de login après déconnexion
+    return redirect('/')  # Rediriger vers la page de login après déconnexion
 
 
 
@@ -67,7 +197,7 @@ def connect_db():
     return conn
 
 # Configuration MQTT
-MQTT_BROKER = "192.168.1.17"#"192.168.28.254" #"192.168.6.254"  # Adresse de ton broker MQTT
+MQTT_BROKER = "192.168.1.17" #"172.20.10.3"#"192.168.28.254" #"192.168.6.254"  # Adresse de ton broker MQTT
 MQTT_PORT = 1883  # Port par défaut de MQTT
 MQTT_TOPIC = "maison/capteurs/dht11"  # Topic pour recevoir les données de température et d'humidité
 LED_TOPIC = "maison/led"  # Topic pour envoyer des commandes pour allumer ou éteindre la LED
@@ -312,6 +442,8 @@ def api_economies():
         data.append({"type": type_facture, "economie": economie})
     conn.close()
     return jsonify(data)
+
+
 
 
 # Route GET pour afficher une page HTML avec un camembert des factures combinées par type
